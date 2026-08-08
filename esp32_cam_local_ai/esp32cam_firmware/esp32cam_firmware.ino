@@ -1,9 +1,10 @@
 #include "esp_camera.h"
 #include <WiFi.h>
 #include <WebServer.h>
+#include "secrets.h"
 
-const char* ssid = "E";
-const char* password = "11235813";
+const char* ssid = WIFI_SSID;
+const char* password = WIFI_PASSWORD;
 
 WebServer server(80);
 
@@ -57,9 +58,8 @@ void handleJPG() {
 }
 
 void handleStream() {
-
   WiFiClient client = server.client();
-
+  client.setTimeout(1000);
   client.println("HTTP/1.1 200 OK");
   client.println("Content-Type: multipart/x-mixed-replace; boundary=frame");
   client.println("Cache-Control: no-cache");
@@ -67,26 +67,21 @@ void handleStream() {
   client.println();
 
   while (client.connected()) {
-
     camera_fb_t *fb = esp_camera_fb_get();
-
-    if (!fb)
+    if (!fb) {
+      delay(10);
       continue;
+    }
 
-    client.printf("--frame\r\n");
-    client.printf("Content-Type: image/jpeg\r\n");
-    client.printf("Content-Length: %u\r\n\r\n", fb->len);
-
-    client.write(fb->buf, fb->len);
-
+    client.printf("--frame\r\nContent-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n", fb->len);
+    size_t written = client.write(fb->buf, fb->len);
     client.print("\r\n");
-
     esp_camera_fb_return(fb);
 
-    delay(30);
-
-    if (!client.connected())
+    if (written != fb->len) {
       break;
+    }
+    delay(1);
   }
 }
 
@@ -126,10 +121,12 @@ void setup() {
     config.frame_size = FRAMESIZE_VGA;
     config.jpeg_quality = 12;
     config.fb_count = 2;
+    config.grab_mode = CAMERA_GRAB_LATEST;
   } else {
     config.frame_size = FRAMESIZE_QVGA;
     config.jpeg_quality = 15;
     config.fb_count = 1;
+    config.grab_mode = CAMERA_GRAB_WHEN_EMPTY;
   }
 
   esp_err_t err = esp_camera_init(&config);

@@ -11,7 +11,7 @@
 ## 2. Flash the firmware
 
 - Open `esp32_cam_local_ai/esp32cam_firmware/esp32cam_webserver.ino`.
-- Update `ssid` and `password` for the target Wi-Fi network.
+- Copy `secrets.example.h` to `secrets.h` and set the target Wi-Fi credentials there.
 - Select board AI Thinker ESP32-CAM.
 - Flash and open Serial Monitor at 115200.
 - Note the IP address printed after `WiFi Connected`.
@@ -40,12 +40,13 @@ The script will announce detected objects via TTS.
 
 - Adjust label set in `detect.py` -> `LABELS_OF_INTEREST`.
 - Adjust confidence threshold if too many or too few detections.
-- Increase `--interval` for slower ESP32 or weaker laptop.
+- Increase `--object-every` on a slower laptop to reserve more processing time for currency checks.
 
-## 7. Stream mode (optional)
+## 7. Live stream mode
 
-- Extend `detect.py` to parse MJPEG from `/stream` for lower latency.
-- Use if `/stream` is stable; otherwise keep snapshot mode.
+- The firmware serves an MJPEG feed at `/stream`; the client uses it by default.
+- The client drops queued old frames to keep inference close to the camera's current position.
+- Use `python detect.py --ip <camera-ip> --mode snapshot` if the stream is unstable.
 
 ## 8. Integrate ESP8266 sensors
 
