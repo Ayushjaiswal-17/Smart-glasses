@@ -8,7 +8,6 @@ artifacts/
 runs/
 
 # Large local model weights
-esp32_cam_local_ai/python_client/models/currency_classifier.pt
 yolo11n-cls.pt
 Currency_images/*
 esp32_cam_local_ai/esp32cam_firmware/secrets.h
