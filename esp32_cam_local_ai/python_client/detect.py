@@ -79,22 +79,25 @@ _speech_queue = queue.Queue(maxsize=4)
 
 
 def _speech_worker():
-    """Keep audio playback off the camera/inference loop."""
-    try:
-        engine = pyttsx3.init()
-        while True:
-            message = _speech_queue.get()
-            try:
-                if message is None:
-                    return
-                engine.say(message)
-                engine.runAndWait()
-            except Exception as error:
-                print("TTS Error:", error)
-            finally:
-                _speech_queue.task_done()
-    except Exception as error:
-        print("TTS Error:", error)
+    """Keep audio playback off inference and recover if the TTS engine fails."""
+    engine = None
+    while True:
+        message = _speech_queue.get()
+        try:
+            if message is None:
+                return
+
+            if engine is None:
+                engine = pyttsx3.init()
+
+            engine.say(message)
+            engine.runAndWait()
+        except Exception as error:
+            print("TTS Error:", error)
+            engine = None
+            time.sleep(1)
+        finally:
+            _speech_queue.task_done()
 
 
 _speech_thread = threading.Thread(target=_speech_worker, daemon=True)
@@ -115,34 +118,58 @@ def speak(text):
 
 
 class CurrencySmoother:
-    """Announce a denomination only after several confident frame predictions."""
+    """Announce each stable note detection once, then re-arm after it leaves view."""
 
-    def __init__(self, window_size=3, minimum_matches=2, confidence=0.80):
+    def __init__(
+        self,
+        window_size=3,
+        minimum_matches=2,
+        confidence=0.80,
+        absence_frames=3,
+        repeat_interval=3.0,
+    ):
         self.predictions = deque(maxlen=window_size)
         self.minimum_matches = minimum_matches
         self.confidence = confidence
+        self.absence_frames = absence_frames
+        self.repeat_interval = repeat_interval
+        self.absent_count = 0
         self.last_announcement = ""
-        self.last_announcement_time = 0
+        self.last_announcement_time = 0.0
+
+    @property
+    def note_visible(self):
+        # A confident first frame is enough to avoid classifying Gandhi's
+        # portrait as a person while the currency decision is being confirmed.
+        return bool(self.last_announcement or self.predictions)
 
     def update(self, results):
-        if not results or getattr(results[0], "probs", None) is None:
-            return None
+        result = results[0] if results else None
+        probs = getattr(result, "probs", None) if result is not None else None
+        if probs is None:
+            label, confidence = None, 0.0
+        else:
+            label = str(result.names[probs.top1])
+            confidence = float(probs.top1conf)
 
-        result = results[0]
-        label = str(result.names[result.probs.top1])
-        confidence = float(result.probs.top1conf)
         if label not in CURRENCY_NAMES or confidence < self.confidence:
             self.predictions.clear()
+            self.absent_count += 1
+            if self.absent_count >= self.absence_frames:
+                self.last_announcement = ""
+                self.last_announcement_time = 0.0
             return None
 
+        self.absent_count = 0
         self.predictions.append(label)
         if len(self.predictions) < self.minimum_matches:
             return None
 
         matches = sum(item == label for item in self.predictions)
-        now = time.time()
+        now = time.monotonic()
         if matches >= self.minimum_matches and (
-            label != self.last_announcement or now - self.last_announcement_time > 8
+            label != self.last_announcement
+            or now - self.last_announcement_time >= self.repeat_interval
         ):
             self.last_announcement = label
             self.last_announcement_time = now
@@ -181,10 +208,16 @@ def process_frame(frame, object_model, currency_model, state):
                 conf = float(box.conf[0])
                 label = result.names[cls]
 
+                # The general COCO detector sees the portrait printed on banknotes
+                # as a person. Currency classification is the more relevant result
+                # in this context, so don't report that conflicting detection.
+                if label == "person" and state.currency_smoother.note_visible:
+                    continue
+
                 if label in LABELS_OF_INTEREST and conf > 0.5:
                     detected.append((label, conf))
 
-        if ULTRALYTICS_AVAILABLE:
+        if ULTRALYTICS_AVAILABLE and not state.currency_smoother.note_visible:
             annotated = results[0].plot()
 
     if detected:
@@ -219,35 +252,63 @@ def process_frame(frame, object_model, currency_model, state):
 def run_stream_mode(base_url, object_model, currency_model=None, object_every=2):
     stream_url = f"{base_url}/stream"
     print(f"Connecting to {stream_url}")
-    cap = cv2.VideoCapture(stream_url)
-    if not cap.isOpened():
-        print("OpenCV could not open the MJPEG stream.")
+    latest_frame = queue.Queue(maxsize=1)
+    stop_reader = threading.Event()
+    stream_error = threading.Event()
+
+    def read_stream():
+        buffer = bytearray()
+        try:
+            with requests.get(stream_url, stream=True, timeout=(5, 5)) as response:
+                response.raise_for_status()
+                for chunk in response.iter_content(chunk_size=4096):
+                    if stop_reader.is_set():
+                        return
+                    if not chunk:
+                        continue
+
+                    buffer.extend(chunk)
+                    while True:
+                        start = buffer.find(b"\xff\xd8")
+                        end = buffer.find(b"\xff\xd9")
+                        if start == -1 or end == -1 or end <= start:
+                            if len(buffer) > 1024 * 1024:
+                                del buffer[:-2]
+                            break
+
+                        jpg = bytes(buffer[start:end + 2])
+                        del buffer[:end + 2]
+                        frame = cv2.imdecode(np.frombuffer(jpg, dtype=np.uint8), cv2.IMREAD_COLOR)
+                        if frame is None:
+                            continue
+
+                        try:
+                            latest_frame.put_nowait(frame)
+                        except queue.Full:
+                            try:
+                                latest_frame.get_nowait()
+                            except queue.Empty:
+                                pass
+                            try:
+                                latest_frame.put_nowait(frame)
+                            except queue.Full:
+                                pass
+        except requests.RequestException as error:
+            print(f"MJPEG stream request failed: {error}")
+            stream_error.set()
+        except Exception as error:
+            print(f"MJPEG stream reader failed: {error}")
+            stream_error.set()
+
+    try:
+        probe = requests.get(f"{base_url}/jpg", timeout=5)
+        probe.raise_for_status()
+    except requests.RequestException as error:
+        print(f"Camera probe failed: {error}")
         return False
 
     # Continuously drain the stream, keeping just one frame so inference always
     # works on the newest camera position instead of processing a stale backlog.
-    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-    latest_frame = queue.Queue(maxsize=1)
-    stop_reader = threading.Event()
-
-    def read_stream():
-        while not stop_reader.is_set():
-            ret, frame = cap.read()
-            if not ret:
-                time.sleep(0.01)
-                continue
-            try:
-                latest_frame.put_nowait(frame)
-            except queue.Full:
-                try:
-                    latest_frame.get_nowait()
-                except queue.Empty:
-                    pass
-                try:
-                    latest_frame.put_nowait(frame)
-                except queue.Full:
-                    pass
-
     reader = threading.Thread(target=read_stream, daemon=True)
     reader.start()
     state = FeedbackState(object_every)
@@ -258,7 +319,7 @@ def run_stream_mode(base_url, object_model, currency_model=None, object_every=2)
                 frame = latest_frame.get(timeout=1)
             except queue.Empty:
                 failed_reads += 1
-                if failed_reads >= 5:
+                if stream_error.is_set() or failed_reads >= 5:
                     print("MJPEG stream stopped responding.")
                     return False
                 continue
@@ -268,7 +329,6 @@ def run_stream_mode(base_url, object_model, currency_model=None, object_every=2)
                 return True
     finally:
         stop_reader.set()
-        cap.release()
         reader.join(timeout=1)
         cv2.destroyAllWindows()
 
